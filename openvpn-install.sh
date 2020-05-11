@@ -182,12 +182,18 @@ if [[ ! -e /etc/openvpn/server/server.conf ]]; then
 	[[ -z "$client" ]] && client="client"
 	echo
 	echo "We are ready to set up your OpenVPN server now."
-	# DigitalOcean ships their CentOS and Fedora images without firewalld
-	# We don't want to silently enable a firewall, so we give a subtle warning
-	# If the user continues, firewalld will be installed and enabled during setup
-	if [[ "$os" == "centos" || "$os" == "fedora" ]] && ! systemctl is-active --quiet firewalld.service; then
-		echo
-		echo "firewalld, which is required to manage routing tables, will also be installed."
+	# Install a firewall in the rare case where one is not already available
+	if ! systemctl is-active --quiet firewalld.service && ! hash iptables 2>/dev/null; then
+		if [[ "$os" == "centos" || "$os" == "fedora" ]]; then
+			firewall="firewalld"
+			# We don't want to silently enable firewalld, so we give a subtle warning
+			# If the user continues, firewalld will be installed and enabled during setup
+			echo
+			echo "firewalld, which is required to manage routing tables, will also be installed."
+		elif [[ "$os" == "debian" || "$os" == "ubuntu" ]]; then
+			# iptables is way less invasive than firewalld so no warning is given
+			firewall="iptables"
+		fi
 	fi
 	echo
 	read -n1 -r -p "Press any key to continue..."
@@ -199,24 +205,23 @@ LimitNPROC=infinity" > /etc/systemd/system/openvpn-server@server.service.d/disab
 	fi
 	if [[ "$os" = "debian" || "$os" = "ubuntu" ]]; then
 		apt-get update
-		apt-get install -y openvpn iptables openssl ca-certificates
+		apt-get install -y openvpn openssl ca-certificates $firewall
 	elif [[ "$os" = "centos" ]]; then
 		yum install -y epel-release
-		yum install -y openvpn firewalld openssl ca-certificates tar
-		systemctl enable --now firewalld.service
+		yum install -y openvpn openssl ca-certificates tar $firewall
 	else
 		# Else, OS must be Fedora
-		dnf install -y openvpn firewalld openssl ca-certificates tar
+		dnf install -y openvpn openssl ca-certificates tar $firewall
+	fi
+	# If firewalld was just installed, enable it
+	if [[ "$firewall" == "firewalld" ]]; then
 		systemctl enable --now firewalld.service
 	fi
 	# Get easy-rsa
 	easy_rsa_url='https://github.com/OpenVPN/easy-rsa/releases/download/v3.0.7/EasyRSA-3.0.7.tgz'
-	wget -O ~/easyrsa.tgz "$easy_rsa_url" 2>/dev/null || curl -Lo ~/easyrsa.tgz "$easy_rsa_url"
-	tar xzf ~/easyrsa.tgz -C ~/
-	mv ~/EasyRSA-3.0.7/ /etc/openvpn/server/
-	mv /etc/openvpn/server/EasyRSA-3.0.7/ /etc/openvpn/server/easy-rsa/
+	mkdir -p /etc/openvpn/server/easy-rsa/
+	{ wget -qO- "$easy_rsa_url" 2>/dev/null || curl -sL "$easy_rsa_url" ; } | tar xz -C /etc/openvpn/server/easy-rsa/ --strip-components 1
 	chown -R root:root /etc/openvpn/server/easy-rsa/
-	rm -f ~/easyrsa.tgz
 	cd /etc/openvpn/server/easy-rsa/
 	# Create the PKI, set up the CA and the server and client certificates
 	./easyrsa init-pki
@@ -340,6 +345,12 @@ crl-verify crl.pem" >> /etc/openvpn/server/server.conf
 		# Create a service to set up persistent iptables rules
 		iptables_path=$(command -v iptables)
 		ip6tables_path=$(command -v ip6tables)
+		# nf_tables is not available as standard in OVZ kernels. So use iptables-legacy
+		# if we are in OVZ, with a nf_tables backend and iptables-legacy is available.
+		if [[ $(systemd-detect-virt) == "openvz" ]] && readlink -f $(command -v iptables) | grep -q "nft" && hash iptables-legacy 2>/dev/null; then
+			iptables_path=$(command -v iptables-legacy)
+			ip6tables_path=$(command -v ip6tables-legacy)
+		fi
 		echo "[Unit]
 Before=network.target
 [Service]
@@ -353,7 +364,7 @@ ExecStop=$iptables_path -D INPUT -p $protocol --dport $port -j ACCEPT
 ExecStop=$iptables_path -D FORWARD -s 10.8.0.0/24 -j ACCEPT
 ExecStop=$iptables_path -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" > /etc/systemd/system/openvpn-iptables.service
 		if [[ -n "$ip6" ]]; then
-			echo "ExecStart=/sbin/ip6tables -t nat -A POSTROUTING -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to $ip6
+			echo "ExecStart=$ip6tables_path -t nat -A POSTROUTING -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to $ip6
 ExecStart=$ip6tables_path -I FORWARD -s fddd:1194:1194:1194::/64 -j ACCEPT
 ExecStart=$ip6tables_path -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
 ExecStop=$ip6tables_path -t nat -D POSTROUTING -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to $ip6
